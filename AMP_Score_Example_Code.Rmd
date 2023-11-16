@@ -1,0 +1,352 @@
+---
+title: "AMP_Score_Example_Code"
+output: html_document
+date: "2023-07-25"
+---
+--
+The following code walks through an example of how to calculate AMP scores. Data is first simulated to mimic MSI data, with two classes generated from a normal distribution with differing means. The data are then split at the sample level, and feature selection is performed using Lasso, random forest, and support vector machine. Following selection, features are weighted using logistic regression, and AMP scores are then calculated and visualized using boxplots and heatmaps. This script can be easily adjusted for use on real MSI data. 
+
+
+## Libraries
+```{r, message=F, warning = F}
+library(tidyverse)
+library(glmnet)
+library(caret)
+library(pROC)
+library(randomForest)
+library(gridExtra)
+library(reticulate)
+#use_virtualenv("r-reticulate")
+```
+
+# Simulate dataset
+```{r}
+# Set the seed for reproducibility
+set.seed(42)
+
+# Parameters
+n_samples <- 10      # Number of samples
+n_rows <- 100        # Number of pixels per sample
+n_features <- 500    # Number of features
+
+# Create empty data frames for dataset 1 and dataset 2
+dataset_1 <- data.frame(
+  sample = rep(paste0("Control_", 1:n_samples), each = n_rows),
+  x = rep(1:n_samples, n_samples),
+  y = rep(1:n_samples, each = n_samples)
+)
+
+dataset_2 <- data.frame(
+  sample = rep(paste0("Case_", 1:n_samples), each = n_rows),
+  x = rep(1:n_samples, n_samples),
+  y = rep(1:n_samples, each = n_samples)
+)
+
+# Generate random values for the features in each sample
+dataset_1[, paste0("feature_", 1:n_features)] <- matrix(
+  rnorm(n_samples * n_rows * n_features, mean = 2, sd = 1),
+  ncol = n_features,
+  byrow = TRUE
+)
+
+dataset_2[, paste0("feature_", 1:n_features)] <- matrix(
+  rnorm(n_samples * n_rows * n_features, mean = 4, sd = 1),
+  ncol = n_features,
+  byrow = TRUE
+)
+
+# Add phenotype column to dataset 1 and dataset 2
+dataset_1$Phenotype <- 0
+dataset_2$Phenotype <- 1
+
+# Combine dataset 1 and dataset 2
+df <- rbind(dataset_1, dataset_2)
+
+```
+
+
+
+## Split into training and testing sets
+```{r}
+# Split into training data at the sample level
+samp <- unique(df$sample)
+train_index <- sample(samp, (2/3)*length(samp), replace = F)
+test_index <- setdiff(samp, train_index)
+
+
+# Create training data
+train <- df[df$sample %in% train_index,]
+x_train <- train %>% 
+  select(-sample, -x, -y, -Phenotype)
+y_train <- as.factor(train$Phenotype)
+
+
+# Create testing data   
+test <- df[df$sample %in% test_index,]
+x_test <- test %>% 
+  select(-sample, -x, -y, -Phenotype)
+y_test<- test$Phenotype %>% 
+  as.factor()
+
+```
+
+# LASSO
+```{r}
+# Perform k-fold cross-validation to find optimal lambda value 
+cv_model <- cv.glmnet(as.matrix(x_train), y_train, alpha = 1, family = 'binomial', type.measure = 'class', standardize = T)
+best_lambda <- cv_model$lambda.min
+  
+# Run model
+lasso_model<- glmnet(as.matrix(x_train), y_train, family='binomial', alpha = 1, lambda = best_lambda, standardize = T)
+
+
+# Pull out features with nonzero coefficients 
+sig_features <- as.matrix(coef(lasso_model)) %>% 
+  as.data.frame() %>% 
+  rownames_to_column(., "feature") %>% 
+  .[-1,]
+ranked_scores <- sig_features %>% 
+  arrange(desc(abs(s0)))
+top_scores <- ranked_scores %>% 
+  filter(s0 !=0)
+top_features_lasso <- top_scores %>% 
+  select(feature)
+
+```
+
+## Run random forest
+```{r}
+# Build model
+rf_model <- randomForest(x = x_train, y = y_train, ntree = 1000, importance = T)
+
+# Access the OOB error rates
+oob_error_rates <- rf_model$err.rate
+
+# Calculate the average OOB error rate
+average_oob_error_rate <- mean(oob_error_rates[, 2])
+
+# Print the average OOB error rate
+print(average_oob_error_rate)
+
+
+# Pull out important m/zs
+scores <- importance(rf_model, type = 2) 
+scores <- data.frame('feature' = rownames(scores), 'imp score' = scores[,1])
+
+# Pull out top x% of scores
+ranked_imp <- sort(scores$imp.score, decreasing = T) 
+ranked_imp <- ranked_imp[1:100] %>% 
+  as.data.frame()
+colnames(ranked_imp) <- 'imp.score'
+top_features_rf <- merge(scores, ranked_imp, by ='imp.score') %>% 
+  select(feature)
+
+# Remove low ranking features from x_train and x_test
+features <- top_features_rf$feature
+x_train_new <- x_train[, colnames(x_train) %in% features]
+
+## Re-run RF with just top features
+rf_model_new <- randomForest(x = x_train_new, y = y_train, ntree = 1000, importance = T) 
+
+# Access the OOB error rates
+oob_error_rates <- rf_model_new$err.rate
+
+# Calculate the average OOB error rate
+average_oob_error_rate <- mean(oob_error_rates[, 2])
+
+# Print the average OOB error rate
+print(average_oob_error_rate)
+```
+
+
+#SVM using sklearn
+#https://support.rstudio.com/hc/en-us/articles/360023654474-Installing-and-Configuring-Python-with-RStudio
+```{python}
+# Import packages
+import pandas as pd
+from sklearn.model_selection import cross_val_score
+from sklearn.svm import SVC
+
+# Read in training and test data 
+X_train = r.x_train
+X_test = r.x_test
+y_train = r.y_train
+y_test = r.y_test
+
+# Create an SVM classifier with a linear kernel
+svm_model = SVC(kernel='linear')
+
+# Perform 5-fold cross-validation
+cross_val_scores = cross_val_score(svm_model, X_train, y_train, cv=5)
+
+# Print the cross-validation scores
+print("Cross-Validation Scores:", cross_val_scores)
+
+# Create and train a linear SVM classifier
+svm_model.fit(X_train, y_train)
+
+# Retrieve the feature coefficients
+feature_coeffs = svm_model.coef_
+
+# Create a DataFrame to store the feature coefficients
+coefficients_df = pd.DataFrame(data=feature_coeffs.T, columns = ['Coefficient'], index = X_train.columns)
+
+# Sort the coefficients_df by the absolute value of Coefficient
+coefficients_df['Abs_Coefficient'] = coefficients_df.abs()
+coefficients_df.sort_values('Abs_Coefficient', ascending = False, inplace = True)
+
+# Extract the top x features
+truncated_df = coefficients_df.head(100)
+top_features_svm = coefficients_df.head(100).index
+
+# Prune the training data to the top 400 features
+X_train_pruned = X_train[top_features_svm]
+
+# Perform 5-fold cross-validation
+cross_val_scores = cross_val_score(svm_model, X_train_pruned, y_train, cv = 5)
+
+# Print the cross-validation scores
+print("Cross-Validation Scores:", cross_val_scores)
+
+```
+
+# Find top features and weight with logistic regression
+```{r}
+# Convert features to vectors 
+top_features_lasso <- as.vector(top_features_lasso$feature) 
+top_features_rf <- as.vector(top_features_rf$feature) 
+top_features_svm <- rownames(py$truncated_df) 
+
+# Get the features that occur in at least two vectors
+common_features <- intersect(intersect(top_features_lasso, top_features_rf), top_features_svm)
+all_features <- union(union(top_features_lasso, top_features_rf), top_features_svm)
+features_twice <- common_features[common_features %in% all_features]
+
+# Subset training data to just important features
+group <- train$Phenotype
+imp_train <- train[, colnames(train) %in% features_twice] 
+imp_train$Phenotype <- group
+
+# Logistic regression
+binom_model <- glm(Phenotype ~., family = 'binomial'(link = 'logit'), data = imp_train)
+beta_df <- binom_model$coefficients[-1] %>% 
+  as.data.frame() %>%
+  tibble::rownames_to_column(., "feature")
+names(beta_df)[2] <- 'betas'
+```
+
+
+# Calculate AMP Scores
+```{r}
+# Subset to just features important in lasso
+meta <- train[, c('sample', 'x', 'y', 'Phenotype')]
+amp_df <- cbind(meta, imp_train)
+
+# Convert to long format
+amp_long_temp <- amp_df %>% 
+  gather(feature, abundance, 5:ncol(amp_df)) 
+
+# Merge with weights
+amp_long <- merge(amp_long_temp, beta_df, by ='feature') %>%
+  mutate(ID = paste0(sample, x, y)) # Create unique identifier for each pixel
+
+# Calculate training scores
+amp_scores <- amp_long %>% 
+  group_by(ID) %>% 
+  mutate(amp = sum(abundance*betas)) %>% 
+  ungroup() %>% 
+  select(-feature, -abundance, -betas)
+amp_scores <- amp_scores[!duplicated(amp_scores),]
+
+# Plot densities
+density_plot<-ggplot(amp_scores, aes(x = amp, fill = as.factor(Phenotype))) + 
+  geom_density(alpha = 0.5) + 
+  ggtitle("Density of training AMP scores")+
+  labs(x='AMP score', y='Density') +
+  theme_classic() +
+  scale_fill_manual(values=c('blue', 'darkorange'))
+print(density_plot)
+
+
+#Find min, max, and intersection point
+min <- min(amp_scores$amp)
+max <- max(amp_scores$amp)
+library(cutpointr)
+cut_info <- cutpointr(amp_scores, amp, Phenotype, method = maximize_metric, metric = youden)
+cut <- cut_info$optimal_cutpoint
+detach("package:cutpointr", unload = TRUE)
+
+
+# Format testing data for AMP score calculation
+meta_test <- test[, c('sample', 'x', 'y', 'Phenotype')]
+imp_test <- test[, colnames(test) %in% features_twice] 
+amp_df_test <- cbind(meta_test, imp_test)
+
+# Convert to long format
+amp_long_temp_test <- amp_df_test %>% 
+  gather(feature, abundance, 5:ncol(amp_df_test)) 
+
+# Merge with weights
+amp_long_test <- merge(amp_long_temp_test, beta_df, by='feature') %>%
+  mutate(ID = paste0(sample, x, y))
+
+# Calculate unscaled testing scores
+amp_scores_test <- amp_long_test %>% 
+  group_by(ID) %>% 
+  mutate(amp = sum(abundance*betas)) %>% 
+  ungroup() %>% 
+  select(-feature, -abundance, -betas)
+amp_scores_test <- amp_scores_test[!duplicated(amp_scores_test),]
+
+# Scale 
+amp_scores_final <- amp_scores_test %>% 
+  mutate(amp= ifelse(amp < cut, 0.5*(amp-min)/(cut-min), 0.5*(amp-cut)/(max-cut)+0.5))
+
+# Get predictions for assessment
+predictions <- amp_scores_final %>%
+  mutate(prediction = ifelse(amp < 0.5, 0, 1)) %>%
+  select(prediction)
+actual <- amp_scores_final$Phenotype %>% 
+  as.data.frame()
+colnames(actual)<-'actual'
+```
+
+# Assess and visualize scores
+```{r}
+# Calculate accuracy, sensitivity, specificity
+sum(predictions == actual) / nrow(predictions) * 100 %>% round(.,3) # Accuracy
+sensitivity(as.factor(predictions$prediction), as.factor(actual$actual)) %>% round(.,3) # Sensitivity
+specificity(as.factor(predictions$prediction), as.factor(actual$actual)) %>% round(.,3)# Specificity
+
+# Plot AMP score heatmaps boxplots
+colors <- c("#21306A", "#821A08")
+b <- ggplot(data = amp_scores_final, aes(x = sample, y = amp, fill = as.factor(Phenotype))) +
+    geom_boxplot(show.legend = F, outlier.size = 0.4) +
+    scale_fill_manual(values = colors) +
+    coord_flip() +
+    theme_classic() + 
+    ylab('AMP Score') +
+    xlab("Sample") 
+
+# Plot AMP score heatmaps
+samples <- unique(amp_scores_final$sample)
+for(i in 1:length(samples)){
+  temp <- amp_scores_final %>%
+    filter(sample == samples[i])
+  
+  # Plot
+  p <- ggplot(temp, aes(x, y, fill = amp)) +
+    labs(x='X', y='Y') +
+    geom_tile(aes(fill = amp, colour = amp)) +
+    scale_fill_gradientn(colors = c('darkblue', 'blue', 'white', 'red', 'darkred'), limits=c(0,1)) +
+    scale_color_gradientn(colors = c('darkblue', 'blue', 'white', 'red', 'darkred'), limits=c(0,1)) +
+    theme(axis.title.x = element_blank(),
+      axis.text.x = element_blank(),
+      axis.ticks.x = element_blank(),
+      axis.title.y = element_blank(),
+      axis.text.y = element_blank(),
+      axis.ticks.y = element_blank()) 
+  print(p)
+}
+```
+
